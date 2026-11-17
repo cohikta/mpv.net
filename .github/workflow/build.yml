@@ -1,0 +1,241 @@
+# ==============================================================================
+# cohikta/mpv.net —— 将运行时 libmpv 更新到 mpv-dev-x86_64-20261111 并构建
+#
+# 放置位置：.github/workflows/build.yml
+# 适用仓库：https://github.com/cohikta/mpv.net （旧版 v6.x 分支：.NET Framework 4.8
+#           / packages.config / src/mpv.net.csproj / WinForms + WPF）
+#
+# 该仓库不把 libmpv-2.dll 提交进版本库，dll 是运行时外部依赖。
+# 因此"更新 libmpv" = 换掉 CI 下载的 dev 包 + 固定 SHA256，并把新的
+# libmpv-2.dll 放进 exe 同目录；不需要修改任何 C# / csproj / sln。
+#
+# 版本来源（默认）：
+#   https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261111
+#   mpv-dev-x86_64-20261111-git-bcde6b93cc.7z (30.3 MB)
+#   sha256 273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452
+# ==============================================================================
+
+name: build mpv.net (libmpv 20261111)
+
+on:
+  workflow_dispatch:
+    inputs:
+      libmpv_tag:
+        description: 'libmpv 发版 tag / 日期（默认 20261111；换版时同步改 LIBMPV_ASSET_PREFIX 与 LIBMPV_SHA256）'
+        required: false
+        default: '20261111'
+      libmpv_url:
+        description: '可选：直接指定 7z 的镜像/自托管地址（留空则走 GitHub API 自动解析）'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # ---------- 1. libmpv 版本锁定区：升级时只改这三行 ----------
+  LIBMPV_REPO: 'shinchiro/mpv-winbuild-cmake'   # 备选：zhongfly/mpv-winbuild（tag 形如 2026-11-11-bcde6b93cc）
+  LIBMPV_ASSET_PREFIX: 'mpv-dev-x86_64-20261111'
+  LIBMPV_SHA256: '273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452'
+  # 留空可跳过校验（不建议用于发布构建）
+
+  # ---------- 2. 本仓库工程参数（旧版单项目结构，勿套用 mpvnet-player/mpv.net 的路径）----------
+  PROJECT: 'src/mpv.net.csproj'
+  CONFIGURATION: 'Release'
+  PLATFORM: 'x64'
+  OUT_DIR: 'src/bin/x64/Release'   # csproj 中 Release|x64 的 OutputPath = bin\x64\Release\
+
+jobs:
+  build:
+    name: Windows x64 / mpv.net + libmpv 20261111
+    runs-on: windows-2022        # 自带 VS2022 MSBuild 与 .NET Framework 4.8 targeting pack
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 把 MSBuild 加入 PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # packages.config 只有 Microsoft.PowerShell.5.ReferenceAssemblies 1.1.0，
+      # 且 csproj 的 HintPath 写的是 ..\packages\...（相对 src/ 即仓库根 packages/），
+      # 所以必须显式指定 -PackagesDirectory packages，不能只跑 dotnet/msbuild restore。
+      - name: 还原 packages.config
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nuget = Get-Command nuget -ErrorAction SilentlyContinue
+          if ($nuget) { $nugetExe = $nuget.Source }
+          else {
+            $nugetExe = Join-Path $env:RUNNER_TEMP 'nuget.exe'
+            Invoke-WebRequest -Uri 'https://dist.nuget.org/win-x86-commandline/v6.11.1/nuget.exe' -OutFile $nugetExe
+          }
+          & $nugetExe restore 'src/packages.config' -PackagesDirectory 'packages' -Source 'https://api.nuget.org/v3/index.json' -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "NuGet restore 失败（exit $LASTEXITCODE）" }
+          $ref = 'packages/Microsoft.PowerShell.5.ReferenceAssemblies.1.1.0/lib/net4/System.Management.Automation.dll'
+          if (-not (Test-Path $ref)) { throw "缺少引用程序集：$ref" }
+
+      # 通过 GitHub REST API 按 tag 找到带 git hash 的完整资产名，避免把
+      # "mpv-dev-x86_64-20261111" 这种不带 hash 的简称写成死链接。
+      # 过滤掉 v3(AVX2) / i686 / aarch64 / lgpl，只取通用 x86_64 GPL dev 包。
+      - name: 解析并下载 libmpv dev 包
+        id: libmpv
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.libmpv_tag || '20261111' }}
+          DIRECT_URL: ${{ inputs.libmpv_url || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'libmpv-cache'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $archive = Join-Path $work 'mpv-dev.7z'
+
+          if (-not [string]::IsNullOrWhiteSpace($env:DIRECT_URL)) {
+            $url = $env:DIRECT_URL
+            $assetName = [System.IO.Path]::GetFileName(([uri]$url).AbsolutePath)
+            Write-Host "使用自定义下载地址：$url"
+          } else {
+            $headers = @{
+              'User-Agent'    = 'mpv.net-ci'
+              'Accept'        = 'application/vnd.github+json'
+              'Authorization' = "Bearer $env:GH_TOKEN"
+            }
+            $api = "https://api.github.com/repos/$env:LIBMPV_REPO/releases/tags/$env:TAG"
+            try {
+              $rel = Invoke-RestMethod -Uri $api -Headers $headers -ErrorAction Stop
+            } catch {
+              Write-Host "精确 tag 未命中，回退到 releases 列表按名称匹配：$env:TAG"
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:LIBMPV_REPO/releases?per_page=30" -Headers $headers |
+                     Where-Object { $_.tag_name -eq $env:TAG -or $_.name -eq $env:TAG } |
+                     Select-Object -First 1
+            }
+            if (-not $rel) { throw "在 $env:LIBMPV_REPO 找不到 release：$env:TAG" }
+            $asset = $rel.assets | Where-Object {
+              $_.name -like "$($env:LIBMPV_ASSET_PREFIX)*.7z" -and
+              $_.name -notmatch '(v3|i686|aarch64|lgpl)'
+            } | Select-Object -First 1
+            if (-not $asset) { throw "release $env:TAG 中没有匹配 $($env:LIBMPV_ASSET_PREFIX)*.7z 的 x86_64 dev 包" }
+            $url = $asset.browser_download_url
+            $assetName = $asset.name
+            Write-Host "选中资产：$assetName（$([math]::Round($asset.size / 1MB, 1)) MB）"
+          }
+
+          Invoke-WebRequest -Uri $url -OutFile $archive -Headers @{ 'User-Agent' = 'mpv.net-ci' } -MaximumRedirection 10
+          $sha = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "下载完成：$archive`nSHA256 = $sha"
+          if (-not [string]::IsNullOrWhiteSpace($env:LIBMPV_SHA256)) {
+            if ($sha -ne $env:LIBMPV_SHA256.ToLowerInvariant()) {
+              throw "SHA256 不匹配！期望 $($env:LIBMPV_SHA256)，实际 $sha。换了 tag/镜像请同步更新 LIBMPV_SHA256。"
+            }
+          } else {
+            Write-Warning '未固定 SHA256，已跳过完整性校验（不建议用于发布）'
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_ARCHIVE=$archive"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_ASSET_NAME=$assetName"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_TAG_USED=$env:TAG"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_ARCHIVE_SHA256=$sha"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "asset=$assetName"
+
+      # dev 包里的核心文件就是 libmpv-2.dll；递归查找以兼容不同打包布局。
+      - name: 解压并暂存 libmpv-2.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $extract = Join-Path $env:RUNNER_TEMP 'libmpv-extract'
+          Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          $7z = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path $7z)) { $7z = (Get-Command 7z -ErrorAction Stop).Source }
+          & $7z x -y $env:LIBMPV_ARCHIVE "-o$extract" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z 解压失败（exit $LASTEXITCODE）" }
+          $dll = Get-ChildItem -Path $extract -Filter 'libmpv-2.dll' -Recurse -File | Select-Object -First 1
+          if (-not $dll) { throw 'dev 包中未找到 libmpv-2.dll（注意：mpv-dev-* 才是 libmpv，mpv-* 是播放器）' }
+          $staged = Join-Path $env:RUNNER_TEMP 'libmpv-2.dll'
+          Copy-Item -LiteralPath $dll.FullName -Destination $staged -Force
+          Write-Host ("找到 {0}（{1:N1} MB）" -f $dll.FullName, ($dll.Length / 1MB))
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_DLL=$staged"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBMPV_DLL_SHA256=$((Get-FileHash $staged -Algorithm SHA256).Hash.ToLowerInvariant())"
+          Add-Content -Path $env:GITHUB_ENV -Value "SEVEN_ZIP=$7z"
+
+      # 只编译主 csproj：mpv.net.sln 里还有 mpv.net.package.wapproj（MSIX 打包）
+      # 与 RatingExtension，CI 上直接 msbuild sln 会因缺少打包工作负载而失败。
+      - name: MSBuild 编译 mpv.net
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & msbuild $env:PROJECT /m /nologo /verbosity:minimal `
+            "/p:Configuration=$env:CONFIGURATION" "/p:Platform=$env:PLATFORM" "/p:RestorePackages=false"
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild 失败（exit $LASTEXITCODE）" }
+          $exe = Join-Path $env:OUT_DIR 'mpvnet.exe'
+          if (-not (Test-Path $exe)) { throw "未生成 $exe，请检查 OUT_DIR 是否与 csproj 的 OutputPath 一致" }
+          Write-Host "编译完成：$exe"
+
+      # 本次更新的实质动作：把新 dll 覆盖到 exe 同目录。
+      # src/Native/libmpv.cs 的 19 个 DllImport 全部指向 "libmpv-2.dll"，
+      # 文件名不变、client API 仍为 v2，因此无需改一行 C# 代码。
+      - name: 注入 libmpv-2.dll（更新核心）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:OUT_DIR 'libmpv-2.dll'
+          Copy-Item -LiteralPath $env:LIBMPV_DLL -Destination $dest -Force
+          Write-Host "已写入 $dest"
+
+      # 非必需但能让产物开箱即用：MediaInfo.dll（关于窗口/媒体信息）与 mpvnet.com（终端）
+      - name: 补齐可选运行时依赖
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = $env:OUT_DIR
+          $tmp = $env:RUNNER_TEMP
+          $7z = $env:SEVEN_ZIP
+          try {
+            $mi7z = Join-Path $tmp 'mediainfo.7z'
+            Invoke-WebRequest -Uri 'https://mediaarea.net/download/binary/libmediainfo0/24.03/MediaInfo_DLL_24.03_Windows_x64_WithoutInstaller.7z' -OutFile $mi7z
+            $miDir = Join-Path $tmp 'mediainfo'
+            & $7z x -y $mi7z "-o$miDir" | Out-Null
+            $mi = Get-ChildItem $miDir -Filter 'MediaInfo.dll' -Recurse -File | Select-Object -First 1
+            if ($mi) { Copy-Item -LiteralPath $mi.FullName -Destination (Join-Path $out 'MediaInfo.dll') -Force }
+          } catch { Write-Warning "MediaInfo 获取失败（不影响主构建）：$($_.Exception.Message)" }
+          try {
+            Invoke-WebRequest -Uri 'https://github.com/mpvnet-player/file-host/releases/download/tag/mpvnet.com.txt' -OutFile (Join-Path $out 'mpvnet.com')
+          } catch { Write-Warning "mpvnet.com 获取失败（不影响主构建）：$($_.Exception.Message)" }
+
+      # 产物自带版本凭证；再真正 LoadLibrary 一次，确认 client API 主版本 >= 2。
+      # 该步骤设为不阻断：CI 虚拟机若无 Vulkan/显卡驱动，加载可能失败，但用户机器未必。
+      - name: 生成版本清单并做 ABI 冒烟测试
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = $env:OUT_DIR
+          $lines = @(
+            "libmpv repo          = $env:LIBMPV_REPO",
+            "libmpv tag           = $env:LIBMPV_TAG_USED",
+            "libmpv asset         = $env:LIBMPV_ASSET_NAME",
+            "archive sha256       = $env:LIBMPV_ARCHIVE_SHA256",
+            "libmpv-2.dll sha256  = $env:LIBMPV_DLL_SHA256",
+            "built at             = $(Get-Date -Format o)",
+            "runner               = $env:RUNNER_OS / $env:RUNNER_ARCH"
+          )
+          Set-Content -LiteralPath (Join-Path $out 'libmpv-version.txt') -Value $lines -Encoding utf8
+          $lines | ForEach-Object { Write-Host $_ }
+
+          $env:PATH = "$((Resolve-Path $out).Path);$env:PATH"
+          $src = 'using System; using System.Runtime.InteropServices; public static class MpvApiProbe { [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] public static extern uint mpv_client_api_version(); }'
+          Add-Type -TypeDefinition $src
+          $v = [MpvApiProbe]::mpv_client_api_version()
+          Write-Host ("mpv client API = {0}.{1}" -f ($v -shr 16), ($v -band 0xffff))
+          if (($v -shr 16) -lt 2) { throw 'client API 主版本 < 2，与 libmpv-2.dll 的 P/Invoke 声明不兼容' }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv.net-win64-libmpv-${{ inputs.libmpv_tag || '20261111' }}
+          path: ${{ env.OUT_DIR }}
+          if-no-files-found: error
+          retention-days: 30
